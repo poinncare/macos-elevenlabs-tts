@@ -1,67 +1,8 @@
 #import <AppKit/AppKit.h>
 #import <AVFoundation/AVFoundation.h>
-#import <ApplicationServices/ApplicationServices.h>
-#import <Carbon/Carbon.h>
-#import <Vision/Vision.h>
 
 static NSString *const DefaultVoice = @"JBFqnCBsd6RMkjVDRZzb";
 static NSString *const VoicePreference = @"voiceID";
-static const EventHotKeyID SelectionHotKeyID = {0x54545321, 1};
-
-static id AccessibilityValue(AXUIElementRef element, CFStringRef attribute) {
-    CFTypeRef value = NULL;
-    if (AXUIElementCopyAttributeValue(element, attribute, &value) != kAXErrorSuccess) return nil;
-    return CFBridgingRelease(value);
-}
-
-static NSString *SelectedText(pid_t pid, BOOL *secureField) {
-    AXUIElementRef app = AXUIElementCreateApplication(pid);
-    AXUIElementSetMessagingTimeout(app, 0.25f);
-    id focused = AccessibilityValue(app, kAXFocusedUIElementAttribute);
-    CFRelease(app);
-    if (!focused || CFGetTypeID((__bridge CFTypeRef)focused) != AXUIElementGetTypeID()) return nil;
-    AXUIElementRef element = (__bridge AXUIElementRef)focused;
-    AXUIElementSetMessagingTimeout(element, 0.25f);
-    *secureField = [AccessibilityValue(element, kAXSubroleAttribute) isEqual:(__bridge NSString *)kAXSecureTextFieldSubrole];
-    if (*secureField) return nil;
-    id text = AccessibilityValue(element, kAXSelectedTextAttribute);
-    return [text isKindOfClass:NSString.class] ? text : nil;
-}
-
-static NSArray<NSPasteboardItem *> *SnapshotPasteboard(NSPasteboard *board) {
-    NSMutableArray *snapshot = [NSMutableArray array];
-    for (NSPasteboardItem *item in board.pasteboardItems) {
-        NSPasteboardItem *copy = [NSPasteboardItem new];
-        for (NSPasteboardType type in item.types) {
-            NSData *data = [item dataForType:type];
-            if (!data || ![copy setData:data forType:type]) return nil;
-        }
-        [snapshot addObject:copy];
-    }
-    return snapshot;
-}
-
-static NSString *PasteboardText(NSPasteboard *board) {
-    NSString *text = [board stringForType:NSPasteboardTypeString];
-    if (text.length) return text;
-    NSData *rtf = [board dataForType:NSPasteboardTypeRTF];
-    return rtf ? [[[NSAttributedString alloc] initWithRTF:rtf documentAttributes:NULL] string] : nil;
-}
-
-static BOOL PostCopy(pid_t pid) {
-    CGEventRef down = CGEventCreateKeyboardEvent(NULL, kVK_ANSI_C, true);
-    CGEventRef up = CGEventCreateKeyboardEvent(NULL, kVK_ANSI_C, false);
-    if (down && up) {
-        CGEventSetFlags(down, kCGEventFlagMaskCommand);
-        CGEventSetFlags(up, kCGEventFlagMaskCommand);
-        CGEventPostToPid(pid, down);
-        CGEventPostToPid(pid, up);
-    }
-    BOOL posted = down && up;
-    if (down) CFRelease(down);
-    if (up) CFRelease(up);
-    return posted;
-}
 
 static NSString *ReadKey(void) {
     NSTask *task = [NSTask new];
@@ -95,32 +36,14 @@ static NSString *RequestError(NSURLResponse *response, NSError *error) {
 @property (nonatomic, strong) NSComboBox *voicePicker;
 @property (nonatomic, strong) NSButton *refreshButton;
 @property (nonatomic, strong) NSButton *stopButton;
-@property (nonatomic, strong) NSTextField *shortcutHint;
-@property (nonatomic, strong) NSButton *permissionButton;
 @property (nonatomic, copy) NSArray<NSDictionary *> *voices;
 @property (nonatomic, copy) NSString *key;
 @property (nonatomic, strong) NSURLSession *session;
 @property (nonatomic, strong) NSURLSessionDataTask *speech;
 @property (nonatomic, strong) AVAudioPlayer *player;
 @property BOOL loadingVoices;
-@property BOOL readingSelection;
 @property NSUInteger generation;
-@property EventHotKeyRef selectionHotKey;
-@property EventHandlerRef hotKeyHandler;
-- (void)readFrontmostSelection;
 @end
-
-static OSStatus HandleSelectionHotKey(EventHandlerCallRef next, EventRef event, void *context) {
-    EventHotKeyID hotKey;
-    if (GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID, NULL,
-                          sizeof(hotKey), NULL, &hotKey) != noErr ||
-        hotKey.signature != SelectionHotKeyID.signature || hotKey.id != SelectionHotKeyID.id) {
-        return eventNotHandledErr;
-    }
-    TTSApp *app = (__bridge TTSApp *)context;
-    dispatch_async(dispatch_get_main_queue(), ^{ [app readFrontmostSelection]; });
-    return noErr;
-}
 
 @implementation TTSApp
 
@@ -141,27 +64,7 @@ static OSStatus HandleSelectionHotKey(EventHandlerCallRef next, EventRef event, 
 
     NSApp.servicesProvider = self;
     NSUpdateDynamicServices();
-    EventTypeSpec hotKeyEvent = {kEventClassKeyboard, kEventHotKeyReleased};
-    EventHandlerRef handler = NULL;
-    if (InstallEventHandler(GetApplicationEventTarget(), HandleSelectionHotKey, 1, &hotKeyEvent,
-                            (__bridge void *)self, &handler) == noErr) {
-        self.hotKeyHandler = handler;
-        EventHotKeyRef hotKey = NULL;
-        OSStatus result = RegisterEventHotKey(kVK_ANSI_V, controlKey, SelectionHotKeyID,
-                                              GetApplicationEventTarget(), kEventHotKeyExclusive, &hotKey);
-        if (result == noErr) self.selectionHotKey = hotKey;
-        else NSLog(@"TTS: Control+V could not be registered (%d)", (int)result);
-    }
     [self loadVoicesShowingErrors:NO];
-}
-
-- (void)applicationWillTerminate:(NSNotification *)notification {
-    if (self.selectionHotKey) UnregisterEventHotKey(self.selectionHotKey);
-    if (self.hotKeyHandler) RemoveEventHandler(self.hotKeyHandler);
-}
-
-- (void)applicationDidBecomeActive:(NSNotification *)notification {
-    [self updateShortcutHint];
 }
 
 - (BOOL)applicationOpenUntitledFile:(NSApplication *)sender {
@@ -178,7 +81,7 @@ static OSStatus HandleSelectionHotKey(EventHandlerCallRef next, EventRef event, 
 - (void)showVoiceWindow:(id)sender {
     if (!self.voiceWindow) {
         NSWindowStyleMask style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable;
-        self.voiceWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 490, 165)
+        self.voiceWindow = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 490, 130)
                                                       styleMask:style backing:NSBackingStoreBuffered defer:NO];
         self.voiceWindow.title = @"TTS — выбор голоса";
         self.voiceWindow.releasedWhenClosed = NO;
@@ -203,11 +106,9 @@ static OSStatus HandleSelectionHotKey(EventHandlerCallRef next, EventRef event, 
         self.stopButton = [NSButton buttonWithTitle:@"Остановить" target:self action:@selector(stop:)];
         NSStackView *buttons = [NSStackView stackViewWithViews:@[self.refreshButton, clipboard, self.stopButton]];
 
-        self.shortcutHint = [NSTextField labelWithString:@""];
-        self.shortcutHint.textColor = NSColor.secondaryLabelColor;
-        self.permissionButton = [NSButton buttonWithTitle:@"Разрешить чтение выделенного текста…"
-                                                  target:self action:@selector(requestAccessibility:)];
-        NSStackView *content = [NSStackView stackViewWithViews:@[voiceRow, buttons, self.shortcutHint, self.permissionButton]];
+        NSTextField *hint = [NSTextField labelWithString:@"Выдели текст в другом приложении и нажми Control + V."];
+        hint.textColor = NSColor.secondaryLabelColor;
+        NSStackView *content = [NSStackView stackViewWithViews:@[voiceRow, buttons, hint]];
         content.orientation = NSUserInterfaceLayoutOrientationVertical;
         content.alignment = NSLayoutAttributeLeading;
         content.spacing = 12;
@@ -223,25 +124,8 @@ static OSStatus HandleSelectionHotKey(EventHandlerCallRef next, EventRef event, 
     }
     [self updateVoicePicker];
     [self updateStatus];
-    [self updateShortcutHint];
     [NSApp activate];
     [self.voiceWindow makeKeyAndOrderFront:nil];
-}
-
-- (void)updateShortcutHint {
-    self.shortcutHint.stringValue = self.selectionHotKey
-        ? @"Выдели текст в любом приложении и нажми Control + V."
-        : @"Control + V недоступно. Проверь, не занято ли сочетание.";
-    self.permissionButton.hidden = AXIsProcessTrusted();
-}
-
-- (void)requestAccessibility:(id)sender {
-    NSDictionary *options = @{(__bridge NSString *)kAXTrustedCheckOptionPrompt: @YES};
-    if (!AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)options)) {
-        NSURL *settings = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"];
-        [NSWorkspace.sharedWorkspace openURL:settings];
-    }
-    [self updateShortcutHint];
 }
 
 - (void)updateVoicePicker {
@@ -303,9 +187,6 @@ static OSStatus HandleSelectionHotKey(EventHandlerCallRef next, EventRef event, 
 - (void)menuNeedsUpdate:(NSMenu *)menu {
     [menu removeAllItems];
     [menu addItem:[self item:@"Открыть окно TTS…" action:@selector(showVoiceWindow:) enabled:YES]];
-    if (!AXIsProcessTrusted()) {
-        [menu addItem:[self item:@"Разрешить чтение выделенного текста…" action:@selector(requestAccessibility:) enabled:YES]];
-    }
     [menu addItem:[self item:@"Озвучить из буфера" action:@selector(speakClipboard:) enabled:YES]];
     [menu addItem:[self item:@"Остановить" action:@selector(stop:) enabled:self.speech || self.player]];
     [menu addItem:NSMenuItem.separatorItem];
@@ -403,123 +284,11 @@ static OSStatus HandleSelectionHotKey(EventHandlerCallRef next, EventRef event, 
 }
 
 - (void)speakSelection:(NSPasteboard *)pasteboard userData:(NSString *)userData error:(NSString **)error {
-    [self speak:PasteboardText(pasteboard) emptyMessage:@"Сначала выдели текст."];
-}
-
-- (void)readFrontmostSelection {
-    if (self.readingSelection) return;
-    if (!AXIsProcessTrusted()) {
-        [self requestAccessibility:nil];
-        return;
-    }
-    NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
-    if (!front) return;
-    pid_t pid = front.processIdentifier;
-    self.readingSelection = YES;
-    NSUInteger generation = self.generation;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        BOOL secureField = NO;
-        NSString *text = [SelectedText(pid, &secureField)
-            stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (generation != self.generation || secureField ||
-                NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier != pid) {
-                self.readingSelection = NO;
-            } else if (text.length) {
-                self.readingSelection = NO;
-                [self speak:text emptyMessage:@""];
-            } else {
-                [self copySelectionFrom:pid generation:generation];
-            }
-        });
-    });
-}
-
-- (void)copySelectionFrom:(pid_t)pid generation:(NSUInteger)generation {
-    NSPasteboard *board = NSPasteboard.generalPasteboard;
-    NSInteger originalCount = board.changeCount;
-    NSArray<NSPasteboardItem *> *snapshot = SnapshotPasteboard(board);
-    if (!snapshot || board.changeCount != originalCount) {
-        self.readingSelection = NO;
-        [self showError:@"Буфер обмена занят. Скопируй текст вручную и нажми «Озвучить из буфера» в TTS."];
-        return;
-    }
-    if (!PostCopy(pid)) {
-        self.readingSelection = NO;
-        [self showError:@"Не удалось скопировать выделение. Скопируй текст вручную и нажми «Озвучить из буфера» в TTS."];
-        return;
-    }
-    [self waitForCopyFrom:pid originalCount:originalCount lastCount:originalCount
-                 snapshot:snapshot remaining:20 generation:generation];
-}
-
-- (void)waitForCopyFrom:(pid_t)pid originalCount:(NSInteger)originalCount lastCount:(NSInteger)lastCount
-               snapshot:(NSArray<NSPasteboardItem *> *)snapshot remaining:(NSUInteger)remaining
-             generation:(NSUInteger)generation {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 60 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-        NSPasteboard *board = NSPasteboard.generalPasteboard;
-        NSInteger current = board.changeCount;
-        BOOL sameApp = NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier == pid;
-        if (sameApp && current != originalCount && (current == lastCount || remaining == 0)) {
-            NSString *text = [PasteboardText(board) stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-            if (board.changeCount == current) {
-                [board clearContents];
-                if (snapshot.count) [board writeObjects:snapshot];
-                self.readingSelection = NO;
-                if (generation == self.generation) {
-                    [self speak:text emptyMessage:@"Не удалось получить текст. Выдели его или скопируй нужную область экрана."];
-                }
-                return;
-            }
-        }
-        if (sameApp && remaining > 0) {
-            [self waitForCopyFrom:pid originalCount:originalCount lastCount:current
-                         snapshot:snapshot remaining:remaining - 1 generation:generation];
-            return;
-        }
-        self.readingSelection = NO;
-        if (sameApp && generation == self.generation) {
-            [self showError:@"Приложение не скопировало текст. Выдели его или скопируй область экрана (Control + Shift + Command + 4), затем нажми «Озвучить из буфера» в TTS."];
-        }
-    });
+    [self speak:[pasteboard stringForType:NSPasteboardTypeString] emptyMessage:@"Сначала выдели текст."];
 }
 
 - (void)speakClipboard:(id)sender {
-    NSPasteboard *board = NSPasteboard.generalPasteboard;
-    NSString *text = [PasteboardText(board) stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceAndNewlineCharacterSet];
-    if (text.length) {
-        [self speak:text emptyMessage:@""];
-        return;
-    }
-    NSData *image = [board dataForType:NSPasteboardTypePNG] ?: [board dataForType:NSPasteboardTypeTIFF]
-        ?: [board dataForType:@"public.jpeg"];
-    if (!image.length) {
-        [self showError:@"Сначала скопируй текст или область экрана (Control + Shift + Command + 4)."];
-        return;
-    }
-    NSUInteger generation = self.generation;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        VNRecognizeTextRequest *request = [VNRecognizeTextRequest new];
-        request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
-        request.automaticallyDetectsLanguage = YES;
-        NSArray *supported = [request supportedRecognitionLanguagesAndReturnError:NULL];
-        if ([supported containsObject:@"ru-RU"] && [supported containsObject:@"en-US"]) {
-            request.recognitionLanguages = @[@"ru-RU", @"en-US"];
-        }
-        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithData:image options:@{}];
-        NSMutableArray<NSString *> *lines = [NSMutableArray array];
-        if ([handler performRequests:@[request] error:NULL]) {
-            for (VNRecognizedTextObservation *observation in request.results) {
-                NSString *line = [observation topCandidates:1].firstObject.string;
-                if (line.length) [lines addObject:line];
-            }
-        }
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (generation == self.generation) {
-                [self speak:[lines componentsJoinedByString:@"\n"] emptyMessage:@"На изображении не удалось распознать текст."];
-            }
-        });
-    });
+    [self speak:[NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString] emptyMessage:@"Сначала скопируй текст."];
 }
 
 - (void)speak:(NSString *)input emptyMessage:(NSString *)emptyMessage {
